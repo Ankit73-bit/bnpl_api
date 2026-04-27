@@ -6,8 +6,14 @@ const { TrackingEvent, ArticleStatus } = require("../models");
 
 const MAX_ARTICLES_PER_REQUEST = 50;
 
+// ─── Public API ───────────────────────────────────────────────────────────────
+
 /**
- * Track up to 50 articles. Saves results to TrackingEvent + ArticleStatus.
+ * Track up to 50 articles in one request.
+ * Saves results to TrackingEvent + ArticleStatus collections.
+ *
+ * @param {string[]} articleNumbers
+ * @returns {Object} Raw India Post tracking response
  */
 async function trackArticles(articleNumbers) {
   if (!Array.isArray(articleNumbers) || articleNumbers.length === 0) {
@@ -31,7 +37,7 @@ async function trackArticles(articleNumbers) {
 
   const result = response.data;
 
-  // Save tracking data to DB (non-blocking)
+  // Persist to DB (non-blocking — failures only log a warning)
   if (result?.data && Array.isArray(result.data)) {
     _persistTrackingResults(result.data, "tracking_api").catch((err) =>
       logger.warn(`Tracking DB save failed: ${err.message}`)
@@ -43,6 +49,9 @@ async function trackArticles(articleNumbers) {
 
 /**
  * Track any number of articles — auto-batches into groups of 50.
+ *
+ * @param {string[]} articleNumbers
+ * @returns {{ success: boolean, total: number, data: Object[] }}
  */
 async function trackArticlesBatched(articleNumbers) {
   if (!Array.isArray(articleNumbers) || articleNumbers.length === 0) {
@@ -50,14 +59,14 @@ async function trackArticlesBatched(articleNumbers) {
   }
 
   const batches = _chunkArray(articleNumbers, MAX_ARTICLES_PER_REQUEST);
-  logger.info(`Tracking: ${articleNumbers.length} articles split into ${batches.length} batch(es)`);
+  logger.info(
+    `Tracking: ${articleNumbers.length} articles split into ${batches.length} batch(es)`
+  );
 
   const results = [];
-
   for (let i = 0; i < batches.length; i++) {
     logger.debug(`Tracking: Processing batch ${i + 1}/${batches.length}`);
     const batchResult = await trackArticles(batches[i]);
-
     if (batchResult?.data && Array.isArray(batchResult.data)) {
       results.push(...batchResult.data);
     }
@@ -67,13 +76,18 @@ async function trackArticlesBatched(articleNumbers) {
 }
 
 /**
- * Download bulk event data for a specific date and customer (XML response).
+ * Download bulk event data for a specific customer + date (XML response).
+ *
+ * @param {{ custId: string, eventCode: string, eventDate: string }} params
+ * @returns {string} Raw XML string from India Post
  */
 async function downloadEvents({ custId, eventCode, eventDate }) {
   _validateEventParams({ custId, eventCode, eventDate });
 
   const token = await authService.getAccessToken();
-  logger.info(`Events: Downloading — custId: ${custId}, code: ${eventCode}, date: ${eventDate}`);
+  logger.info(
+    `Events: Downloading — custId: ${custId}, code: ${eventCode}, date: ${eventDate}`
+  );
 
   const response = await apiClient.post(
     config.indiaPost.endpoints.eventDownload,
@@ -87,89 +101,11 @@ async function downloadEvents({ custId, eventCode, eventDate }) {
   return response.data;
 }
 
-// ─── DB persistence ───────────────────────────────────────────────────────────
-
 /**
- * For each article in a tracking API response, save each tracking event
- * and upsert the current ArticleStatus.
- */
-async function _persistTrackingResults(articleDataArray, source = "tracking_api") {
-  for (const articleData of articleDataArray) {
-    const { booking_details, tracking_details, del_status } = articleData;
-    const articleNumber = booking_details?.article_number;
-
-    if (!articleNumber) continue;
-
-    // Save each tracking event
-    if (Array.isArray(tracking_details)) {
-      const eventDocs = tracking_details.map((evt) => ({
-        articleNumber,
-        articleType: booking_details.article_type || null,
-        eventCode: evt.event || "UNKNOWN",
-        eventDescription: evt.event || null,
-        eventDate: evt.date ? evt.date.split("T")[0] : null,
-        eventTime: evt.time || null,
-        eventDateTime: _parseEventDateTime(evt.date, evt.time),
-        eventOfficeFacilityId: String(evt.officeid || ""),
-        eventOfficeName: evt.office || null,
-        destinationPincode: booking_details.destination_pincode
-          ? Number(booking_details.destination_pincode)
-          : null,
-        tariff: booking_details.tariff || null,
-        source,
-      }));
-
-      // Use insertMany with ordered:false — skips duplicates gracefully
-      if (eventDocs.length > 0) {
-        await TrackingEvent.insertMany(eventDocs, { ordered: false }).catch(() => {});
-      }
-    }
-
-    // Upsert the current article status
-    const latestEvent = tracking_details?.[tracking_details.length - 1];
-    await _upsertArticleStatus(articleNumber, booking_details, del_status, latestEvent);
-  }
-}
-
-/**
- * Upsert the ArticleStatus document for one article.
- */
-async function _upsertArticleStatus(articleNumber, bookingDetails, delStatus, latestEvent) {
-  const deliveryStatus = _mapDeliveryStatus(
-    delStatus?.del_status,
-    latestEvent?.event
-  );
-
-  const update = {
-    articleType: bookingDetails?.article_type || null,
-    deliveryStatus,
-    latestEventCode: latestEvent?.event || null,
-    latestEventDescription: latestEvent?.event || null,
-    latestEventOfficeName: latestEvent?.office || null,
-    latestEventDateTime: _parseEventDateTime(latestEvent?.date, latestEvent?.time),
-    destinationPincode: bookingDetails?.destination_pincode
-      ? Number(bookingDetails.destination_pincode)
-      : null,
-    tariff: bookingDetails?.tariff || null,
-    $inc: { eventCount: 0 }, // keep count updated via webhook instead
-  };
-
-  if (deliveryStatus === "delivered") {
-    update.deliveredAt = _parseEventDateTime(latestEvent?.date, latestEvent?.time);
-    update.deliveryOfficeName = latestEvent?.office || null;
-  }
-
-  await ArticleStatus.findOneAndUpdate(
-    { articleNumber },
-    { $set: update },
-    { upsert: true, new: true }
-  );
-}
-
-// ─── Shared helpers (also exported for webhook use) ──────────────────────────
-
-/**
- * Save a single webhook event payload to TrackingEvent + upsert ArticleStatus.
+ * Persist a single webhook event payload to TrackingEvent + upsert ArticleStatus.
+ * Called by webhookService after receiving a push from India Post.
+ *
+ * @param {Object} payload - Raw India Post webhook body
  */
 async function saveWebhookEvent(payload) {
   const {
@@ -208,121 +144,185 @@ async function saveWebhookEvent(payload) {
 
   const eventDateTime = _parseEventDateTime(event_date, event_time);
 
-  // 1. Save the event
+  // 1. Save the raw event record
   await TrackingEvent.create({
-    articleNumber: article_number,
-    articleType: article_type || null,
-    eventCode: event_code,
-    eventDescription: event_description || null,
-    eventDate: event_date || null,
-    eventTime: event_time || null,
+    articleNumber:              article_number,
+    articleType:                article_type || null,
+    eventCode:                  event_code,
+    eventDescription:           event_description || null,
+    eventDate:                  event_date || null,
+    eventTime:                  event_time || null,
     eventDateTime,
-    eventOfficeFacilityId: String(event_office_facility_id || ""),
-    eventOfficeName: event_office_name || null,
-    bookingRefId: booking_ref_id ? String(booking_ref_id) : null,
-    bookingDate: booking_date || null,
-    bookingTime: booking_time || null,
-    bookingOfficeFacilityId: booking_office_facility_id
-      ? String(booking_office_facility_id)
-      : null,
-    bookingOfficeName: booking_office_name || null,
-    bookingPin: booking_pin || null,
-    senderAddressCity: sender_address_city || null,
-    destinationOfficeFacilityId: destination_office_facility_id || null,
-    destinationOfficeName: destination_office_name || null,
-    destinationPincode: destination_pincode || null,
-    destinationCity: destination_city || null,
-    destinationCountry: destination_country || null,
-    receiverName: receiver_name || null,
-    invoiceNo: invoice_no || null,
-    lineItem: line_item ? String(line_item) : null,
-    weightValue: weight_value || null,
-    tariff: tariff || null,
-    codAmount: cod_amount || null,
-    bookingType: booking_type || null,
-    contractNumber: contract_number || null,
-    reference: reference || null,
-    bulkCustomerId: bulk_customer_id || null,
-    nonDeliveryReason: non_delivery_reason || null,
-    source: "webhook",
+    eventOfficeFacilityId:      String(event_office_facility_id || ""),
+    eventOfficeName:            event_office_name || null,
+    bookingRefId:               booking_ref_id ? String(booking_ref_id) : null,
+    bookingDate:                booking_date || null,
+    bookingTime:                booking_time || null,
+    bookingOfficeFacilityId:    booking_office_facility_id ? String(booking_office_facility_id) : null,
+    bookingOfficeName:          booking_office_name || null,
+    bookingPin:                 booking_pin || null,
+    senderAddressCity:          sender_address_city || null,
+    destinationOfficeFacilityId:destination_office_facility_id || null,
+    destinationOfficeName:      destination_office_name || null,
+    destinationPincode:         destination_pincode || null,
+    destinationCity:            destination_city || null,
+    destinationCountry:         destination_country || null,
+    receiverName:               receiver_name || null,
+    invoiceNo:                  invoice_no || null,
+    lineItem:                   line_item ? String(line_item) : null,
+    weightValue:                weight_value || null,
+    tariff:                     tariff || null,
+    codAmount:                  cod_amount || null,
+    bookingType:                booking_type || null,
+    contractNumber:             contract_number || null,
+    reference:                  reference || null,
+    bulkCustomerId:             bulk_customer_id || null,
+    nonDeliveryReason:          non_delivery_reason || null,
+    source:                     "webhook",
   });
 
-  // 2. Upsert ArticleStatus
+  // 2. Upsert the latest status snapshot for this article
   const deliveryStatus = _mapDeliveryStatus(null, event_code);
 
-  const statusUpdate = {
-    articleType: article_type || null,
+  const statusFields = {
+    articleType:            article_type || null,
     deliveryStatus,
-    latestEventCode: event_code,
+    latestEventCode:        event_code,
     latestEventDescription: event_description || null,
-    latestEventOfficeName: event_office_name || null,
-    latestEventDateTime: eventDateTime,
-    bookingRefId: booking_ref_id ? String(booking_ref_id) : null,
-    bookingDate: booking_date || null,
-    bookingOfficeName: booking_office_name || null,
-    bookingPin: booking_pin || null,
-    senderCity: sender_address_city || null,
-    destinationOfficeName: destination_office_name || null,
-    destinationPincode: destination_pincode || null,
-    destinationCity: destination_city || null,
-    receiverName: receiver_name || null,
-    tariff: tariff || null,
-    weightValue: weight_value || null,
-    codAmount: cod_amount || 0,
-    bulkCustomerId: bulk_customer_id || null,
-    contractNumber: contract_number || null,
-    reference: reference || null,
-    nonDeliveryReason: non_delivery_reason || null,
-    $inc: { eventCount: 1 },
+    latestEventOfficeName:  event_office_name || null,
+    latestEventDateTime:    eventDateTime,
+    bookingRefId:           booking_ref_id ? String(booking_ref_id) : null,
+    bookingDate:            booking_date || null,
+    bookingOfficeName:      booking_office_name || null,
+    bookingPin:             booking_pin || null,
+    senderCity:             sender_address_city || null,
+    destinationOfficeName:  destination_office_name || null,
+    destinationPincode:     destination_pincode || null,
+    destinationCity:        destination_city || null,
+    receiverName:           receiver_name || null,
+    tariff:                 tariff || null,
+    weightValue:            weight_value || null,
+    codAmount:              cod_amount || 0,
+    bulkCustomerId:         bulk_customer_id || null,
+    contractNumber:         contract_number || null,
+    reference:              reference || null,
+    nonDeliveryReason:      non_delivery_reason || null,
   };
 
   if (deliveryStatus === "delivered") {
-    statusUpdate.deliveredAt = eventDateTime;
-    statusUpdate.deliveryOfficeName = event_office_name || null;
+    statusFields.deliveredAt       = eventDateTime;
+    statusFields.deliveryOfficeName = event_office_name || null;
   }
   if (deliveryStatus === "returned") {
-    statusUpdate.returnedAt = eventDateTime;
+    statusFields.returnedAt = eventDateTime;
   }
 
+  // Use separate $set and $inc operators (not spread together — Mongoose rejects that)
   await ArticleStatus.findOneAndUpdate(
     { articleNumber: article_number },
-    { $set: { ...statusUpdate, $inc: undefined }, $inc: { eventCount: 1 } },
+    { $set: statusFields, $inc: { eventCount: 1 } },
     { upsert: true, new: true }
   );
 
-  logger.debug(`Tracking DB: Saved event ${event_code} for ${article_number}`);
+  logger.debug(`Tracking DB: Saved webhook event ${event_code} for ${article_number}`);
 }
 
-// ─── Private helpers ─────────────────────────────────────────────────────────
+// ─── Private: DB persistence helpers ─────────────────────────────────────────
+
+/**
+ * For each article in a tracking-API response array, persist every tracking
+ * event and upsert the current ArticleStatus document.
+ */
+async function _persistTrackingResults(articleDataArray, source = "tracking_api") {
+  for (const articleData of articleDataArray) {
+    const { booking_details, tracking_details, del_status } = articleData;
+    const articleNumber = booking_details?.article_number;
+    if (!articleNumber) continue;
+
+    if (Array.isArray(tracking_details) && tracking_details.length > 0) {
+      const eventDocs = tracking_details.map((evt) => ({
+        articleNumber,
+        articleType:            booking_details.article_type || null,
+        eventCode:              evt.event || "UNKNOWN",
+        eventDescription:       evt.event || null,
+        eventDate:              evt.date ? evt.date.split("T")[0] : null,
+        eventTime:              evt.time || null,
+        eventDateTime:          _parseEventDateTime(evt.date, evt.time),
+        eventOfficeFacilityId:  String(evt.officeid || ""),
+        eventOfficeName:        evt.office || null,
+        destinationPincode:     booking_details.destination_pincode
+                                  ? Number(booking_details.destination_pincode)
+                                  : null,
+        tariff:                 booking_details.tariff || null,
+        source,
+      }));
+
+      // ordered: false — skip duplicates without aborting the batch
+      await TrackingEvent.insertMany(eventDocs, { ordered: false }).catch(() => {});
+    }
+
+    const latestEvent = tracking_details?.[tracking_details.length - 1];
+    await _upsertArticleStatus(articleNumber, booking_details, del_status, latestEvent);
+  }
+}
+
+/**
+ * Upsert the ArticleStatus document for one article from a tracking-API result.
+ */
+async function _upsertArticleStatus(articleNumber, bookingDetails, delStatus, latestEvent) {
+  const deliveryStatus = _mapDeliveryStatus(delStatus?.del_status, latestEvent?.event);
+
+  const statusFields = {
+    articleType:            bookingDetails?.article_type || null,
+    deliveryStatus,
+    latestEventCode:        latestEvent?.event || null,
+    latestEventDescription: latestEvent?.event || null,
+    latestEventOfficeName:  latestEvent?.office || null,
+    latestEventDateTime:    _parseEventDateTime(latestEvent?.date, latestEvent?.time),
+    destinationPincode:     bookingDetails?.destination_pincode
+                              ? Number(bookingDetails.destination_pincode)
+                              : null,
+    tariff: bookingDetails?.tariff || null,
+  };
+
+  if (deliveryStatus === "delivered") {
+    statusFields.deliveredAt       = _parseEventDateTime(latestEvent?.date, latestEvent?.time);
+    statusFields.deliveryOfficeName = latestEvent?.office || null;
+  }
+
+  await ArticleStatus.findOneAndUpdate(
+    { articleNumber },
+    { $set: statusFields },
+    { upsert: true, new: true }
+  );
+}
+
+// ─── Private: small utilities ─────────────────────────────────────────────────
 
 const DELIVERY_STATUS_MAP = {
-  ITEM_BOOK: "booked",
-  ITEM_BAGGED: "in_transit",
-  BAG_CLOSE: "in_transit",
-  ITEM_DISPATCHED: "in_transit",
-  ITEM_RECEIVED: "in_transit",
-  ITEM_INVOICED: "out_for_delivery",
-  ITEM_DELIVERED: "delivered",
-  ITEM_NOT_DELIVERED: "failed_delivery",
-  ITEM_RETURNED: "returned",
-  RTS: "returned",
+  ITEM_BOOK:           "booked",
+  ITEM_BAGGED:         "in_transit",
+  BAG_CLOSE:           "in_transit",
+  ITEM_DISPATCHED:     "in_transit",
+  ITEM_RECEIVED:       "in_transit",
+  ITEM_INVOICED:       "out_for_delivery",
+  ITEM_DELIVERED:      "delivered",
+  ITEM_NOT_DELIVERED:  "failed_delivery",
+  ITEM_RETURNED:       "returned",
+  RTS:                 "returned",
 };
 
 function _mapDeliveryStatus(delStatusStr, eventCode) {
   if (delStatusStr === "delivered") return "delivered";
-  if (delStatusStr === "returned") return "returned";
+  if (delStatusStr === "returned")  return "returned";
   return DELIVERY_STATUS_MAP[eventCode] || "in_transit";
 }
 
 function _parseEventDateTime(dateStr, timeStr) {
   if (!dateStr) return null;
   try {
-    const datePart = dateStr.includes("T")
-      ? dateStr.split("T")[0]
-      : dateStr;
-    return timeStr
-      ? new Date(`${datePart}T${timeStr}`)
-      : new Date(datePart);
+    const datePart = dateStr.includes("T") ? dateStr.split("T")[0] : dateStr;
+    return timeStr ? new Date(`${datePart}T${timeStr}`) : new Date(datePart);
   } catch {
     return null;
   }

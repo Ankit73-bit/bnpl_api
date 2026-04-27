@@ -16,7 +16,6 @@ async function connectDB() {
 
   // Log a sanitised version of the URI so you can confirm it's being read correctly
   const sanitised = uri.replace(/:([^@]+)@/, ":****@");
-  logger.info(`MongoDB: Connecting to → ${sanitised}`);
 
   try {
     await mongoose.connect(uri, {
